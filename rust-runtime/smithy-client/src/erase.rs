@@ -15,7 +15,8 @@ use tower::{Layer, Service, ServiceExt};
 ///
 /// Mainly useful if you need to name `R` in a type-erased client. If you do not, you can instead
 /// just use `Client` with no type parameters, which ends up being the same type.
-pub type DynClient<R = retry::Standard> = Client<DynConnector, DynMiddleware<DynConnector>, R>;
+pub type DynClient<R = retry::SharedRetryHandler> =
+    Client<DynConnector, DynMiddleware<DynConnector>, R>;
 
 impl<C, M, R> Client<C, M, R>
 where

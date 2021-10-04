@@ -11,6 +11,7 @@ default = ["chrono-conversions"]
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = [] }
+fastrand = "1.4.0"
 itoa = "0.4.0"
 num-integer = "0.1"
 ryu = "1.0.5"

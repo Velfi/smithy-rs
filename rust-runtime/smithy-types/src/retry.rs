@@ -5,7 +5,7 @@
 
 //! This module defines types that describe when to retry given a response.
 
-use std::time::Duration;
+use std::{default::Default, time::Duration};
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 #[non_exhaustive]
@@ -67,4 +67,138 @@ pub enum RetryKind {
 
     /// The response associated with this variant should not be retried.
     NotRetryable,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryMode {
+    /// The default retry behavior used by SDK clients, rate-limited with a configurable number of max attempts.
+    Standard,
+    /// This behavior includes the functionality of standard mode but with automatic client-side throttling. Currently unimplemented
+    Adaptive,
+}
+
+impl Default for RetryMode {
+    fn default() -> Self {
+        RetryMode::Standard
+    }
+}
+
+/// Retry Policy Configuration
+///
+/// Without specific use cases, users should generally rely on the default values set by `[Config::default]`(Config::default).`
+///
+/// Currently these fields are private and no setters provided. As needed, this configuration will become user-modifiable in the future..
+#[derive(Clone, Debug)]
+pub struct RetryConfig {
+    base_fn: fn() -> f64,
+    initial_retry_tokens: usize,
+    max_attempts: u32,
+    max_backoff: Duration,
+    mode: RetryMode,
+    no_retry_increment: usize,
+    retry_cost: usize,
+    timeout_retry_cost: usize,
+}
+
+impl RetryConfig {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    /// Override `b` in the exponential backoff computation
+    ///
+    /// By default, `base` is a randomly generated value between 0 and 1. In tests, it can
+    /// be helpful to override this:
+    /// ```rust
+    /// use smithy_client::retry::Config;
+    /// let conf = Config::default().with_base(||1_f64);
+    /// ```
+    pub fn with_base(mut self, base: fn() -> f64) -> Self {
+        self.base_fn = base;
+        self
+    }
+
+    /// Override the retry mode
+    pub fn with_mode(mut self, mode: RetryMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Override the maximum number of attempts
+    pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = max_attempts;
+        self
+    }
+
+    /// Override the initial amount of retry tokens
+    pub fn with_initial_retry_tokens(mut self, initial_retry_tokens: usize) -> Self {
+        self.initial_retry_tokens = initial_retry_tokens;
+        self
+    }
+
+    /// Override the maximum retry backoff
+    pub fn with_max_backoff(mut self, max_backoff: Duration) -> Self {
+        self.max_backoff = max_backoff;
+        self
+    }
+
+    /// Get the retry config's max attempts.
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts
+    }
+
+    /// Get the retry config's max backoff.
+    pub fn max_backoff(&self) -> Duration {
+        self.max_backoff
+    }
+
+    pub fn base(&self) -> f64 {
+        (self.base_fn)()
+    }
+
+    /// Get the retry config's no retry increment.
+    pub fn no_retry_increment(&self) -> usize {
+        self.no_retry_increment
+    }
+
+    /// Get the retry config's retry cost.
+    pub fn retry_cost(&self) -> usize {
+        self.retry_cost
+    }
+
+    /// Get the retry config's timeout retry cost.
+    pub fn timeout_retry_cost(&self) -> usize {
+        self.timeout_retry_cost
+    }
+
+    /// Get the retry config's initial retry tokens.
+    pub fn initial_retry_tokens(&self) -> usize {
+        self.initial_retry_tokens
+    }
+
+    /// Get the retry config's mode.
+    pub fn mode(&self) -> RetryMode {
+        self.mode
+    }
+}
+
+const MAX_ATTEMPTS: u32 = 3;
+const INITIAL_RETRY_TOKENS: usize = 500;
+const RETRY_COST: usize = 5;
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            mode: Default::default(),
+            initial_retry_tokens: INITIAL_RETRY_TOKENS,
+            retry_cost: RETRY_COST,
+            no_retry_increment: 1,
+            timeout_retry_cost: 10,
+            max_attempts: MAX_ATTEMPTS,
+            max_backoff: Duration::from_secs(20),
+            // by default, use a random base for exponential backoff
+            base_fn: fastrand::f64,
+        }
+    }
 }

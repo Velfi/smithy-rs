@@ -14,13 +14,12 @@
 //!   Its sole purpose in life is to create a [`RetryHandler`] for individual requests.
 //! - [`RetryHandler`]: A request-scoped retry policy, backed by request-local state and shared
 //!   state contained within [`Standard`].
-//! - [`Config`]: Static configuration (max retries, max backoff etc.)
 
 use crate::{SdkError, SdkSuccess};
 use smithy_http::operation;
 use smithy_http::operation::Operation;
 use smithy_http::retry::ClassifyResponse;
-use smithy_types::retry::{ErrorKind, RetryKind};
+use smithy_types::retry::{ErrorKind, RetryConfig, RetryKind, RetryMode};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -40,62 +39,6 @@ pub trait NewRequestPolicy {
     fn new_request_policy(&self) -> Self::Policy;
 }
 
-/// Retry Policy Configuration
-///
-/// Without specific use cases, users should generally rely on the default values set by `[Config::default]`(Config::default).`
-///
-/// Currently these fields are private and no setters provided. As needed, this configuration will become user-modifiable in the future..
-#[derive(Clone, Debug)]
-pub struct Config {
-    initial_retry_tokens: usize,
-    retry_cost: usize,
-    no_retry_increment: usize,
-    timeout_retry_cost: usize,
-    max_retries: u32,
-    max_backoff: Duration,
-    base: fn() -> f64,
-}
-
-impl Config {
-    /// Override `b` in the exponential backoff computation
-    ///
-    /// By default, `base` is a randomly generated value between 0 and 1. In tests, it can
-    /// be helpful to override this:
-    /// ```rust
-    /// use smithy_client::retry::Config;
-    /// let conf = Config::default().with_base(||1_f64);
-    /// ```
-    pub fn with_base(mut self, base: fn() -> f64) -> Self {
-        self.base = base;
-        self
-    }
-
-    /// Override the maximum number of retries
-    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
-        self.max_retries = max_retries;
-        self
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            initial_retry_tokens: INITIAL_RETRY_TOKENS,
-            retry_cost: RETRY_COST,
-            no_retry_increment: 1,
-            timeout_retry_cost: 10,
-            max_retries: MAX_RETRIES,
-            max_backoff: Duration::from_secs(20),
-            // by default, use a random base for exponential backoff
-            base: fastrand::f64,
-        }
-    }
-}
-
-const MAX_RETRIES: u32 = 3;
-const INITIAL_RETRY_TOKENS: usize = 500;
-const RETRY_COST: usize = 5;
-
 /// Manage retries for a service
 ///
 /// An implementation of the `standard` AWS retry strategy as specified in the SEP. A `Strategy` is scoped to a client.
@@ -106,32 +49,32 @@ const RETRY_COST: usize = 5;
 /// Its main functionality is via `new_request_policy` which creates a `RetryHandler` to manage the retry for
 /// an individual request.
 #[derive(Debug)]
-pub struct Standard {
-    config: Config,
+pub struct SharedRetryHandler {
+    config: RetryConfig,
     shared_state: CrossRequestRetryState,
 }
 
-impl Standard {
+impl SharedRetryHandler {
     /// Construct a new standard retry policy from the given policy configuration.
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: RetryConfig) -> Self {
         Self {
-            shared_state: CrossRequestRetryState::new(config.initial_retry_tokens),
+            shared_state: CrossRequestRetryState::new(config.initial_retry_tokens()),
             config,
         }
     }
 
     /// Set the configuration for this retry policy.
-    pub fn with_config(&mut self, config: Config) -> &mut Self {
+    pub fn with_config(&mut self, config: RetryConfig) -> &mut Self {
         self.config = config;
         self
     }
 }
 
-impl NewRequestPolicy for Standard {
-    type Policy = RetryHandler;
+impl NewRequestPolicy for SharedRetryHandler {
+    type Policy = LocalRetryHandler;
 
     fn new_request_policy(&self) -> Self::Policy {
-        RetryHandler {
+        LocalRetryHandler {
             local: RequestLocalRetryState::new(),
             shared: self.shared_state.clone(),
             config: self.config.clone(),
@@ -139,9 +82,9 @@ impl NewRequestPolicy for Standard {
     }
 }
 
-impl Default for Standard {
+impl Default for SharedRetryHandler {
     fn default() -> Self {
-        Self::new(Config::default())
+        Self::new(RetryConfig::default())
     }
 }
 
@@ -179,21 +122,21 @@ impl CrossRequestRetryState {
         }
     }
 
-    fn quota_release(&self, value: Option<usize>, config: &Config) {
+    fn quota_release(&self, value: Option<usize>, config: &RetryConfig) {
         let mut quota = self.quota_available.lock().unwrap();
-        *quota += value.unwrap_or(config.no_retry_increment);
+        *quota += value.unwrap_or(config.no_retry_increment());
     }
 
     /// Attempt to acquire retry quota for `ErrorKind`
     ///
     /// If quota is available, the amount of quota consumed is returned
     /// If no quota is available, `None` is returned.
-    fn quota_acquire(&self, err: &ErrorKind, config: &Config) -> Option<usize> {
+    fn quota_acquire(&self, err: &ErrorKind, config: &RetryConfig) -> Option<usize> {
         let mut quota = self.quota_available.lock().unwrap();
         let retry_cost = if err == &ErrorKind::TransientError {
-            config.timeout_retry_cost
+            config.timeout_retry_cost()
         } else {
-            config.retry_cost
+            config.retry_cost()
         };
         if retry_cost > *quota {
             None
@@ -210,25 +153,31 @@ impl CrossRequestRetryState {
 /// It is intended to be used as a [Tower Retry Policy](tower::retry::Policy) for use in tower-based
 /// middleware stacks.
 #[derive(Clone, Debug)]
-pub struct RetryHandler {
+pub struct LocalRetryHandler {
     local: RequestLocalRetryState,
     shared: CrossRequestRetryState,
-    config: Config,
+    config: RetryConfig,
 }
 
 #[cfg(test)]
-impl RetryHandler {
+impl LocalRetryHandler {
     fn retry_quota(&self) -> usize {
         *self.shared.quota_available.lock().unwrap()
     }
 }
 
-impl RetryHandler {
+impl LocalRetryHandler {
     /// Determine the correct response given `retry_kind`
     ///
     /// If a retry is specified, this function returns `(next, backoff_duration)`
     /// If no retry is specified, this function returns None
     fn attempt_retry(&self, retry_kind: Result<(), ErrorKind>) -> Option<(Self, Duration)> {
+        if self.config.mode() == RetryMode::Adaptive {
+            unimplemented!(
+                "Adaptive retry mode is not yet implemented, please use the Standard retry mode"
+            )
+        }
+
         let quota_used = match retry_kind {
             Ok(_) => {
                 self.shared
@@ -236,7 +185,7 @@ impl RetryHandler {
                 return None;
             }
             Err(e) => {
-                if self.local.attempts == self.config.max_retries - 1 {
+                if self.local.attempts == self.config.max_attempts() {
                     return None;
                 }
                 self.shared.quota_acquire(&e, &self.config)?
@@ -249,10 +198,10 @@ impl RetryHandler {
             t_i = min(br^i, MAX_BACKOFF);
          */
         let r: i32 = 2;
-        let b = (self.config.base)();
+        let b = self.config.base();
         let backoff = b * (r.pow(self.local.attempts) as f64);
-        let backoff = Duration::from_secs_f64(backoff).min(self.config.max_backoff);
-        let next = RetryHandler {
+        let backoff = Duration::from_secs_f64(backoff).min(self.config.max_backoff());
+        let next = LocalRetryHandler {
             local: RequestLocalRetryState {
                 attempts: self.local.attempts + 1,
                 last_quota_usage: Some(quota_used),
@@ -267,7 +216,7 @@ impl RetryHandler {
 
 impl<Handler, R, T, E>
     tower::retry::Policy<operation::Operation<Handler, R>, SdkSuccess<T>, SdkError<E>>
-    for RetryHandler
+    for LocalRetryHandler
 where
     Handler: Clone,
     R: ClassifyResponse<SdkSuccess<T>, SdkError<E>>,
@@ -307,24 +256,24 @@ fn check_send_sync<T: Send>(t: T) -> T {
 
 #[cfg(test)]
 mod test {
-    use crate::retry::{Config, NewRequestPolicy, RetryHandler, Standard};
-    use smithy_types::retry::ErrorKind;
+    use crate::retry::{LocalRetryHandler, NewRequestPolicy, SharedRetryHandler};
+    use smithy_types::retry::{ErrorKind, RetryConfig};
     use std::time::Duration;
 
     fn assert_send_sync<T: Send + Sync>() {}
 
-    fn test_config() -> Config {
-        Config::default().with_base(|| 1_f64)
+    fn test_config() -> RetryConfig {
+        RetryConfig::default().with_base(|| 1_f64)
     }
 
     #[test]
     fn retry_handler_send_sync() {
-        assert_send_sync::<RetryHandler>()
+        assert_send_sync::<LocalRetryHandler>()
     }
 
     #[test]
     fn eventual_success() {
-        let policy = Standard::new(test_config()).new_request_policy();
+        let policy = SharedRetryHandler::new(test_config()).new_request_policy();
         let (policy, dur) = policy
             .attempt_retry(Err(ErrorKind::ServerError))
             .expect("should retry");
@@ -344,7 +293,7 @@ mod test {
 
     #[test]
     fn no_more_attempts() {
-        let policy = Standard::new(test_config()).new_request_policy();
+        let policy = SharedRetryHandler::new(test_config()).new_request_policy();
         let (policy, dur) = policy
             .attempt_retry(Err(ErrorKind::ServerError))
             .expect("should retry");
@@ -364,9 +313,8 @@ mod test {
 
     #[test]
     fn no_quota() {
-        let mut conf = test_config();
-        conf.initial_retry_tokens = 5;
-        let policy = Standard::new(conf).new_request_policy();
+        let conf = test_config().with_initial_retry_tokens(5);
+        let policy = SharedRetryHandler::new(conf).new_request_policy();
         let (policy, dur) = policy
             .attempt_retry(Err(ErrorKind::ServerError))
             .expect("should retry");
@@ -379,9 +327,8 @@ mod test {
 
     #[test]
     fn backoff_timing() {
-        let mut conf = test_config();
-        conf.max_retries = 5;
-        let policy = Standard::new(conf).new_request_policy();
+        let conf = test_config().with_max_attempts(5);
+        let policy = SharedRetryHandler::new(conf).new_request_policy();
         let (policy, dur) = policy
             .attempt_retry(Err(ErrorKind::ServerError))
             .expect("should retry");
@@ -413,10 +360,10 @@ mod test {
 
     #[test]
     fn max_backoff_time() {
-        let mut conf = test_config();
-        conf.max_retries = 5;
-        conf.max_backoff = Duration::from_secs(3);
-        let policy = Standard::new(conf).new_request_policy();
+        let conf = test_config()
+            .with_max_attempts(5)
+            .with_max_backoff(Duration::from_secs(3));
+        let policy = SharedRetryHandler::new(conf).new_request_policy();
         let (policy, dur) = policy
             .attempt_retry(Err(ErrorKind::ServerError))
             .expect("should retry");

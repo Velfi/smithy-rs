@@ -89,7 +89,7 @@ type BoxError = Box<dyn Error + Send + Sync>;
 
 /// Smithy service client.
 ///
-/// The service client is customizeable in a number of ways (see [`Builder`]), but most customers
+/// The service client is customizable in a number of ways (see [`Builder`]), but most customers
 /// can stick with the standard constructor provided by [`Client::new`]. It takes only a single
 /// argument, which is the middleware that fills out the [`http::Request`] for each higher-level
 /// operation so that it can ultimately be sent to the remote host. The middleware is responsible
@@ -110,7 +110,7 @@ type BoxError = Box<dyn Error + Send + Sync>;
 pub struct Client<
     Connector = erase::DynConnector,
     Middleware = erase::DynMiddleware<Connector>,
-    RetryPolicy = retry::Standard,
+    RetryPolicy = retry::SharedRetryHandler,
 > {
     connector: Connector,
     middleware: Middleware,
@@ -134,12 +134,12 @@ where
 
 impl<C, M> Client<C, M> {
     /// Set the standard retry policy's configuration.
-    pub fn set_retry_config(&mut self, config: retry::Config) {
+    pub fn set_retry_config(&mut self, config: smithy_types::retry::RetryConfig) {
         self.retry_policy.with_config(config);
     }
 
     /// Adjust a standard retry client with the given policy configuration.
-    pub fn with_retry_config(mut self, config: retry::Config) -> Self {
+    pub fn with_retry_config(mut self, config: smithy_types::retry::RetryConfig) -> Self {
         self.set_retry_config(config);
         self
     }
@@ -188,7 +188,7 @@ where
             // Create a new request-scoped policy
             .retry(self.retry_policy.new_request_policy())
             .layer(ParseResponseLayer::<O, Retry>::new())
-            // These layers can be considered as occuring in order. That is, first invoke the
+            // These layers can be considered as occurring in order. That is, first invoke the
             // customer-provided middleware, then dispatch dispatch over the wire.
             .layer(&self.middleware)
             .layer(DispatchLayer::new())

@@ -7,7 +7,7 @@ use smithy_http::body::SdkBody;
 /// When configured to your liking, call [`Builder::build`]. The individual methods have additional
 /// documentation.
 #[derive(Clone, Debug, Default)]
-pub struct Builder<C = (), M = (), R = retry::Standard> {
+pub struct Builder<C = (), M = (), R = retry::SharedRetryHandler> {
     connector: C,
     middleware: M,
     retry_policy: R,
@@ -136,7 +136,7 @@ impl<C, R> Builder<C, (), R> {
     }
 }
 
-impl<C, M> Builder<C, M, retry::Standard> {
+impl<C, M> Builder<C, M, retry::SharedRetryHandler> {
     /// Specify the retry policy for the eventual client to use.
     ///
     /// By default, the Smithy client uses a standard retry policy that works well in most
@@ -157,7 +157,7 @@ impl<C, M> Builder<C, M, retry::Standard> {
 
 impl<C, M> Builder<C, M> {
     /// Set the standard retry policy's configuration.
-    pub fn set_retry_config(&mut self, config: retry::Config) {
+    pub fn set_retry_config(&mut self, config: smithy_types::retry::RetryConfig) {
         self.retry_policy.with_config(config);
     }
 }
